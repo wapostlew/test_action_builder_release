@@ -88,22 +88,28 @@ jobs:
         env:
           NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
           PREV_RELEASE: ${{ steps.vars.outputs.prev_release }}
+          IS_FIRST_RELEASE: ${{ steps.vars.outputs.is_first_release }}
           ACTOR: ${{ github.actor }}
           MERGE_INTO_MASTER: ${{ inputs.merge_into_master }}
           FEATURE_BRANCHES: ${{ inputs.feature_branches }}
         run: |
+          PREV_LABEL="${PREV_RELEASE}"
+          if [[ "$IS_FIRST_RELEASE" == "true" ]]; then
+            PREV_LABEL="${PREV_RELEASE} (first release — no previous release branch)"
+          fi
+
           echo "## Release Preparation Plan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| New release | \`${NEW_RELEASE}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Previous release | \`${PREV_RELEASE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Base branch | \`${PREV_LABEL}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Triggered by | @${ACTOR} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Merge into master | ${MERGE_INTO_MASTER} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "🔀 New release:      ${NEW_RELEASE}"
-          echo "⬅️  Previous release: ${PREV_RELEASE}"
+          echo "🔀 New release:  ${NEW_RELEASE}"
+          echo "⬅️  Base branch: ${PREV_LABEL}"
           echo "📋 Feature branches: ${FEATURE_BRANCHES}"
 
       - name: Create release branch from previous release
@@ -126,6 +132,7 @@ jobs:
         env:
           NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
           PREV_RELEASE: ${{ steps.vars.outputs.prev_release }}
+          IS_FIRST_RELEASE: ${{ steps.vars.outputs.is_first_release }}
           PUSH_FEATURES: ${{ inputs.push_feature_branches }}
           FEATURE_BRANCHES: ${{ inputs.feature_branches }}
         run: |
@@ -154,18 +161,22 @@ jobs:
               git checkout -b "${FEATURE}" "origin/${FEATURE}"
             fi
 
-            # Merge previous release into feature branch
-            echo "Merging ${PREV_RELEASE} → ${FEATURE}..."
-            if ! git merge --no-ff "origin/${PREV_RELEASE}" -m "Merge ${PREV_RELEASE} into ${FEATURE}"; then
-              echo "::error::Conflict merging ${PREV_RELEASE} into ${FEATURE}. Resolve manually."
-              git merge --abort
-              FAILED+=("${FEATURE} (conflict with ${PREV_RELEASE})")
-              git checkout "${NEW_RELEASE}"
-              continue
-            fi
+            # Merge previous release into feature branch (skip on first release)
+            if [[ "$IS_FIRST_RELEASE" == "false" ]]; then
+              echo "Merging ${PREV_RELEASE} → ${FEATURE}..."
+              if ! git merge --no-ff "origin/${PREV_RELEASE}" -m "Merge ${PREV_RELEASE} into ${FEATURE}"; then
+                echo "::error::Conflict merging ${PREV_RELEASE} into ${FEATURE}. Resolve manually."
+                git merge --abort
+                FAILED+=("${FEATURE} (conflict with ${PREV_RELEASE})")
+                git checkout "${NEW_RELEASE}"
+                continue
+              fi
 
-            if [[ "$PUSH_FEATURES" == "true" ]]; then
-              git push origin "${FEATURE}"
+              if [[ "$PUSH_FEATURES" == "true" ]]; then
+                git push origin "${FEATURE}"
+              fi
+            else
+              echo "ℹ️  First release — skipping merge of ${PREV_RELEASE} into ${FEATURE}"
             fi
 
             # Merge feature branch into new release
