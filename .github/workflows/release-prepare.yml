@@ -1,0 +1,241 @@
+name: Prepare Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_date:
+        description: 'Release date (YYYY-MM-DD). Defaults to today.'
+        required: false
+        type: string
+        default: ''
+      feature_branches:
+        description: 'Feature branches to merge (one per line or comma-separated). Example: feature/auth, feature/payments'
+        required: true
+        type: string
+      push_feature_branches:
+        description: 'Push updated feature branches to remote (after merging prev release into them)'
+        required: false
+        type: boolean
+        default: true
+      merge_into_master:
+        description: 'Merge the new release into master when done'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  prepare-release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+
+      - name: Resolve release date and branch names
+        id: vars
+        run: |
+          if [[ -n "${{ inputs.release_date }}" ]]; then
+            RELEASE_DATE="${{ inputs.release_date }}"
+          else
+            RELEASE_DATE=$(date +%Y-%m-%d)
+          fi
+
+          NEW_RELEASE="release/${RELEASE_DATE}"
+
+          # Auto-detect previous release branch (latest by date, excluding the new one)
+          PREV_RELEASE=$(git branch -r \
+            | grep -oE 'origin/release/[0-9]{4}-[0-9]{2}-[0-9]{2}' \
+            | sed 's|origin/||' \
+            | grep -v "^${NEW_RELEASE}$" \
+            | sort -r \
+            | head -1)
+
+          if [[ -z "$PREV_RELEASE" ]]; then
+            echo "::error::Could not auto-detect a previous release branch."
+            exit 1
+          fi
+
+          echo "release_date=${RELEASE_DATE}"   >> "$GITHUB_OUTPUT"
+          echo "new_release=${NEW_RELEASE}"      >> "$GITHUB_OUTPUT"
+          echo "prev_release=${PREV_RELEASE}"    >> "$GITHUB_OUTPUT"
+
+      - name: Print plan
+        run: |
+          echo "## Release Preparation Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| New release | \`${{ steps.vars.outputs.new_release }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Previous release | \`${{ steps.vars.outputs.prev_release }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Merge into master | ${{ inputs.merge_into_master }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "🔀 New release:      ${{ steps.vars.outputs.new_release }}"
+          echo "⬅️  Previous release: ${{ steps.vars.outputs.prev_release }}"
+          echo "📋 Feature branches: ${{ inputs.feature_branches }}"
+
+      - name: Create release branch from previous release
+        run: |
+          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
+          PREV_RELEASE="${{ steps.vars.outputs.prev_release }}"
+
+          if git show-ref --verify --quiet "refs/remotes/origin/${NEW_RELEASE}"; then
+            echo "⚠️  Branch '${NEW_RELEASE}' already exists on remote — checking it out."
+            git checkout -b "${NEW_RELEASE}" "origin/${NEW_RELEASE}"
+          else
+            echo "Creating ${NEW_RELEASE} from origin/${PREV_RELEASE}..."
+            git checkout -b "${NEW_RELEASE}" "origin/${PREV_RELEASE}"
+            git push origin "${NEW_RELEASE}"
+            echo "✅ Created and pushed ${NEW_RELEASE}"
+          fi
+
+      - name: Merge feature branches into release
+        id: merge
+        run: |
+          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
+          PREV_RELEASE="${{ steps.vars.outputs.prev_release }}"
+          PUSH_FEATURES="${{ inputs.push_feature_branches }}"
+
+          # Normalize input: support both comma and newline separators
+          RAW_BRANCHES="${{ inputs.feature_branches }}"
+          BRANCHES=$(echo "$RAW_BRANCHES" | tr ',' '\n' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | grep -v '^$')
+
+          MERGED=()
+          FAILED=()
+
+          while IFS= read -r FEATURE; do
+            echo ""
+            echo "━━━ Processing: ${FEATURE} ━━━"
+
+            # Verify branch exists on remote
+            if ! git show-ref --verify --quiet "refs/remotes/origin/${FEATURE}"; then
+              echo "::error::Branch '${FEATURE}' not found on remote."
+              FAILED+=("${FEATURE} (not found on remote)")
+              continue
+            fi
+
+            # Checkout feature branch
+            if git show-ref --verify --quiet "refs/heads/${FEATURE}"; then
+              git checkout "${FEATURE}"
+              git pull origin "${FEATURE}"
+            else
+              git checkout -b "${FEATURE}" "origin/${FEATURE}"
+            fi
+
+            # Merge previous release into feature branch
+            echo "Merging ${PREV_RELEASE} → ${FEATURE}..."
+            if ! git merge --no-ff "origin/${PREV_RELEASE}" -m "Merge ${PREV_RELEASE} into ${FEATURE}"; then
+              echo "::error::Conflict merging ${PREV_RELEASE} into ${FEATURE}. Resolve manually."
+              git merge --abort
+              FAILED+=("${FEATURE} (conflict with ${PREV_RELEASE})")
+              git checkout "${NEW_RELEASE}"
+              continue
+            fi
+
+            if [[ "$PUSH_FEATURES" == "true" ]]; then
+              git push origin "${FEATURE}"
+            fi
+
+            # Merge feature branch into new release
+            echo "Merging ${FEATURE} → ${NEW_RELEASE}..."
+            git checkout "${NEW_RELEASE}"
+
+            if ! git merge --no-ff "${FEATURE}" -m "Merge ${FEATURE} into ${NEW_RELEASE}"; then
+              echo "::error::Conflict merging ${FEATURE} into ${NEW_RELEASE}. Resolve manually."
+              git merge --abort
+              FAILED+=("${FEATURE} (conflict with ${NEW_RELEASE})")
+              continue
+            fi
+
+            echo "✅ Merged ${FEATURE} into ${NEW_RELEASE}"
+            MERGED+=("${FEATURE}")
+
+          done <<< "$BRANCHES"
+
+          # Push updated release branch
+          git push origin "${NEW_RELEASE}"
+          echo "✅ Pushed ${NEW_RELEASE}"
+
+          # Write summary
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Merge Results" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ${#MERGED[@]} -gt 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ✅ Merged successfully" >> "$GITHUB_STEP_SUMMARY"
+            for b in "${MERGED[@]}"; do
+              echo "- \`${b}\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+          if [[ ${#FAILED[@]} -gt 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ❌ Failed" >> "$GITHUB_STEP_SUMMARY"
+            for b in "${FAILED[@]}"; do
+              echo "- \`${b}\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo "FAILED_COUNT=${#FAILED[@]}" >> "$GITHUB_ENV"
+          else
+            echo "FAILED_COUNT=0" >> "$GITHUB_ENV"
+          fi
+
+          echo "MERGED_LIST=${MERGED[*]}" >> "$GITHUB_ENV"
+
+      - name: Merge release into master
+        if: ${{ inputs.merge_into_master == true }}
+        run: |
+          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
+
+          echo "Merging ${NEW_RELEASE} → master..."
+          git checkout master
+          git pull origin master
+
+          if ! git merge --no-ff "${NEW_RELEASE}" -m "Merge ${NEW_RELEASE} into master"; then
+            echo "::error::Conflict merging ${NEW_RELEASE} into master. Resolve manually."
+            git merge --abort
+            exit 1
+          fi
+
+          git push origin master
+          echo "✅ Merged ${NEW_RELEASE} → master and pushed"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Master" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ \`${NEW_RELEASE}\` merged into \`master\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final summary
+        run: |
+          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Next Steps" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${FAILED_COUNT}" -gt 0 ]]; then
+            echo "1. Resolve merge conflicts listed above manually" >> "$GITHUB_STEP_SUMMARY"
+            echo "2. Re-run workflow for the failed branches" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${{ inputs.merge_into_master }}" != "true" ]]; then
+            echo "- Merge into master when ready: \`git merge --no-ff ${NEW_RELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "- Update **Jenkins** to deploy branch: \`${NEW_RELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${FAILED_COUNT}" -gt 0 ]]; then
+            echo "⚠️  Completed with ${FAILED_COUNT} failed branch(es). Check the summary above."
+            exit 1
+          else
+            echo "🎉 Release branch ${NEW_RELEASE} is ready!"
+          fi
