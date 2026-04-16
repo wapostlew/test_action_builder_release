@@ -23,6 +23,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: release-prepare-${{ inputs.release_date || 'today' }}
+  cancel-in-progress: false
+
 jobs:
   prepare-release:
     name: Prepare Release
@@ -38,15 +42,21 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
+        env:
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
         run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git config user.name "$ACTOR"
+          git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
 
       - name: Resolve release date and branch names
         id: vars
+        env:
+          INPUT_RELEASE_DATE: ${{ inputs.release_date }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          if [[ -n "${{ inputs.release_date }}" ]]; then
-            RELEASE_DATE="${{ inputs.release_date }}"
+          if [[ -n "$INPUT_RELEASE_DATE" ]]; then
+            RELEASE_DATE="$INPUT_RELEASE_DATE"
           else
             RELEASE_DATE=$(date +%Y-%m-%d)
           fi
@@ -62,35 +72,45 @@ jobs:
             | head -1)
 
           if [[ -z "$PREV_RELEASE" ]]; then
-            echo "::error::Could not auto-detect a previous release branch."
-            exit 1
+            echo "::notice::No previous release branch found — first release will be created from '${DEFAULT_BRANCH}'."
+            IS_FIRST_RELEASE="true"
+            PREV_RELEASE="$DEFAULT_BRANCH"
+          else
+            IS_FIRST_RELEASE="false"
           fi
 
-          echo "release_date=${RELEASE_DATE}"   >> "$GITHUB_OUTPUT"
-          echo "new_release=${NEW_RELEASE}"      >> "$GITHUB_OUTPUT"
-          echo "prev_release=${PREV_RELEASE}"    >> "$GITHUB_OUTPUT"
+          echo "release_date=${RELEASE_DATE}"       >> "$GITHUB_OUTPUT"
+          echo "new_release=${NEW_RELEASE}"          >> "$GITHUB_OUTPUT"
+          echo "prev_release=${PREV_RELEASE}"        >> "$GITHUB_OUTPUT"
+          echo "is_first_release=${IS_FIRST_RELEASE}" >> "$GITHUB_OUTPUT"
 
       - name: Print plan
+        env:
+          NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
+          PREV_RELEASE: ${{ steps.vars.outputs.prev_release }}
+          ACTOR: ${{ github.actor }}
+          MERGE_INTO_MASTER: ${{ inputs.merge_into_master }}
+          FEATURE_BRANCHES: ${{ inputs.feature_branches }}
         run: |
           echo "## Release Preparation Plan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| New release | \`${{ steps.vars.outputs.new_release }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Previous release | \`${{ steps.vars.outputs.prev_release }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Triggered by | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Merge into master | ${{ inputs.merge_into_master }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| New release | \`${NEW_RELEASE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Previous release | \`${PREV_RELEASE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | @${ACTOR} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Merge into master | ${MERGE_INTO_MASTER} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "🔀 New release:      ${{ steps.vars.outputs.new_release }}"
-          echo "⬅️  Previous release: ${{ steps.vars.outputs.prev_release }}"
-          echo "📋 Feature branches: ${{ inputs.feature_branches }}"
+          echo "🔀 New release:      ${NEW_RELEASE}"
+          echo "⬅️  Previous release: ${PREV_RELEASE}"
+          echo "📋 Feature branches: ${FEATURE_BRANCHES}"
 
       - name: Create release branch from previous release
+        env:
+          NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
+          PREV_RELEASE: ${{ steps.vars.outputs.prev_release }}
         run: |
-          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
-          PREV_RELEASE="${{ steps.vars.outputs.prev_release }}"
-
           if git show-ref --verify --quiet "refs/remotes/origin/${NEW_RELEASE}"; then
             echo "⚠️  Branch '${NEW_RELEASE}' already exists on remote — checking it out."
             git checkout -b "${NEW_RELEASE}" "origin/${NEW_RELEASE}"
@@ -103,14 +123,14 @@ jobs:
 
       - name: Merge feature branches into release
         id: merge
+        env:
+          NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
+          PREV_RELEASE: ${{ steps.vars.outputs.prev_release }}
+          PUSH_FEATURES: ${{ inputs.push_feature_branches }}
+          FEATURE_BRANCHES: ${{ inputs.feature_branches }}
         run: |
-          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
-          PREV_RELEASE="${{ steps.vars.outputs.prev_release }}"
-          PUSH_FEATURES="${{ inputs.push_feature_branches }}"
-
           # Normalize input: support both comma and newline separators
-          RAW_BRANCHES="${{ inputs.feature_branches }}"
-          BRANCHES=$(echo "$RAW_BRANCHES" | tr ',' '\n' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | grep -v '^$')
+          BRANCHES=$(echo "$FEATURE_BRANCHES" | tr ',' '\n' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | grep -v '^$')
 
           MERGED=()
           FAILED=()
@@ -191,34 +211,34 @@ jobs:
             echo "FAILED_COUNT=0" >> "$GITHUB_ENV"
           fi
 
-          echo "MERGED_LIST=${MERGED[*]}" >> "$GITHUB_ENV"
-
       - name: Merge release into master
         if: ${{ inputs.merge_into_master == true }}
+        env:
+          NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
+          echo "Merging ${NEW_RELEASE} → ${DEFAULT_BRANCH}..."
+          git checkout "$DEFAULT_BRANCH"
+          git pull origin "$DEFAULT_BRANCH"
 
-          echo "Merging ${NEW_RELEASE} → master..."
-          git checkout master
-          git pull origin master
-
-          if ! git merge --no-ff "${NEW_RELEASE}" -m "Merge ${NEW_RELEASE} into master"; then
-            echo "::error::Conflict merging ${NEW_RELEASE} into master. Resolve manually."
+          if ! git merge --no-ff "${NEW_RELEASE}" -m "Merge ${NEW_RELEASE} into ${DEFAULT_BRANCH}"; then
+            echo "::error::Conflict merging ${NEW_RELEASE} into ${DEFAULT_BRANCH}. Resolve manually."
             git merge --abort
             exit 1
           fi
 
-          git push origin master
-          echo "✅ Merged ${NEW_RELEASE} → master and pushed"
+          git push origin "$DEFAULT_BRANCH"
+          echo "✅ Merged ${NEW_RELEASE} → ${DEFAULT_BRANCH} and pushed"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Master" >> "$GITHUB_STEP_SUMMARY"
-          echo "✅ \`${NEW_RELEASE}\` merged into \`master\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ \`${NEW_RELEASE}\` merged into \`${DEFAULT_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Final summary
+        env:
+          NEW_RELEASE: ${{ steps.vars.outputs.new_release }}
+          MERGE_INTO_MASTER: ${{ inputs.merge_into_master }}
         run: |
-          NEW_RELEASE="${{ steps.vars.outputs.new_release }}"
-
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Next Steps" >> "$GITHUB_STEP_SUMMARY"
 
@@ -227,7 +247,7 @@ jobs:
             echo "2. Re-run workflow for the failed branches" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [[ "${{ inputs.merge_into_master }}" != "true" ]]; then
+          if [[ "$MERGE_INTO_MASTER" != "true" ]]; then
             echo "- Merge into master when ready: \`git merge --no-ff ${NEW_RELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
           fi
 
